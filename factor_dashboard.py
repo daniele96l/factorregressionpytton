@@ -20,20 +20,43 @@ import statsmodels.api as sm
 FACTOR_FILE = Path(__file__).resolve().parent / "3factormodelusa.csv"
 DEFAULT_PORTFOLIO_FILE = Path(__file__).resolve().parent / "smallcapvalueusa.csv"
 DEFAULT_PORTFOLIO_COLUMN = "MSCI USA Small Cap Value Weighted"
+FX_FILE = Path(__file__).resolve().parent / "usd_eur_rate_rows.csv"
 
 
 def parse_ff3_factors(raw: pd.DataFrame) -> pd.DataFrame:
     raw = raw.rename(columns={raw.columns[0]: "Date"})
     raw["Date"] = raw["Date"].astype(str).str.strip()
+    monthly_rows = raw[raw["Date"].str.fullmatch(r"\d{6}", na=False)].copy()
+    daily_rows = raw[raw["Date"].str.fullmatch(r"\d{8}", na=False)].copy()
 
-    monthly = raw[raw["Date"].str.fullmatch(r"\d{6}", na=False)].copy()
-    monthly["Date"] = pd.to_datetime(monthly["Date"], format="%Y%m") + pd.offsets.MonthEnd(0)
+    base_cols = ["Mkt-RF", "SMB", "HML", "RF"]
+    optional_cols = [c for c in ["RMW", "CMA"] if c in raw.columns]
+    cols = [*base_cols[:-1], *optional_cols, "RF"]
 
-    for col in ["Mkt-RF", "SMB", "HML", "RF"]:
-        monthly[col] = pd.to_numeric(monthly[col], errors="coerce") / 100.0
+    if not monthly_rows.empty:
+        monthly_rows["Date"] = pd.to_datetime(monthly_rows["Date"], format="%Y%m") + pd.offsets.MonthEnd(0)
+        for col in cols:
+            monthly_rows[col] = pd.to_numeric(monthly_rows[col], errors="coerce") / 100.0
+        monthly_rows = monthly_rows.dropna(subset=cols).sort_values("Date")
+        return monthly_rows[["Date", *cols]]
 
-    monthly = monthly.dropna(subset=["Mkt-RF", "SMB", "HML", "RF"]).sort_values("Date")
-    return monthly[["Date", "Mkt-RF", "SMB", "HML", "RF"]]
+    if not daily_rows.empty:
+        daily_rows["Date"] = pd.to_datetime(daily_rows["Date"], format="%Y%m%d", errors="coerce")
+        for col in cols:
+            daily_rows[col] = pd.to_numeric(daily_rows[col], errors="coerce") / 100.0
+        daily_rows = daily_rows.dropna(subset=["Date", *cols]).sort_values("Date")
+        daily_rows["MonthEnd"] = daily_rows["Date"] + pd.offsets.MonthEnd(0)
+
+        # Convert daily factors to monthly by compounding within each month.
+        monthly_from_daily = (
+            daily_rows.groupby("MonthEnd", as_index=False)[cols]
+            .apply(lambda g: pd.Series({c: (1.0 + g[c]).prod() - 1.0 for c in cols}))
+            .reset_index(drop=True)
+        )
+        monthly_from_daily = monthly_from_daily.rename(columns={"MonthEnd": "Date"})
+        return monthly_from_daily[["Date", *cols]].sort_values("Date")
+
+    raise ValueError("Factor file format not recognized: expected YYYYMM or YYYYMMDD dates.")
 
 
 def load_ff3_factors(path: Path) -> pd.DataFrame:
@@ -77,7 +100,17 @@ def load_portfolio_prices_from_content(contents: str, fallback_path: Path) -> pd
     return out
 
 
-def build_regression_dataset(contents: str, factor_contents: str, factor_choice: str) -> tuple[pd.DataFrame, str]:
+def load_usd_eur_monthly_rates(path: Path) -> pd.DataFrame:
+    fx = pd.read_csv(path, usecols=["date", "rate"])
+    fx["Date"] = pd.to_datetime(fx["date"], errors="coerce") + pd.offsets.MonthEnd(0)
+    fx["USDEUR"] = pd.to_numeric(fx["rate"], errors="coerce")
+    fx = fx.dropna(subset=["Date", "USDEUR"]).sort_values("Date")
+    # Keep one value per month, using latest daily quote.
+    fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
+    return fx[["Date", "USDEUR"]]
+
+
+def build_regression_dataset(contents: str, factor_contents: str, factor_choice: str) -> tuple[pd.DataFrame, str, list[str]]:
     if factor_choice == "uploaded":
         factors, factor_label = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)
     else:
@@ -90,13 +123,14 @@ def build_regression_dataset(contents: str, factor_contents: str, factor_choice:
     if merged.empty:
         raise ValueError("No overlapping dates between portfolio and factor data.")
 
+    factor_cols = [c for c in ["Mkt-RF", "SMB", "HML", "RMW", "CMA"] if c in merged.columns]
     merged["ExcessReturn"] = merged["PortfolioReturn"] - merged["RF"]
-    merged = merged.dropna(subset=["ExcessReturn", "Mkt-RF", "SMB", "HML"]).sort_values("Date")
-    return merged, factor_label
+    merged = merged.dropna(subset=["ExcessReturn", *factor_cols]).sort_values("Date")
+    return merged, factor_label, factor_cols
 
 
-def run_factor_regression(dataset: pd.DataFrame) -> tuple[pd.DataFrame, dict, np.ndarray, object]:
-    x = dataset[["Mkt-RF", "SMB", "HML"]]
+def run_factor_regression(dataset: pd.DataFrame, factor_cols: list[str]) -> tuple[pd.DataFrame, dict, np.ndarray, object]:
+    x = dataset[factor_cols]
     y = dataset["ExcessReturn"]
 
     if len(dataset) < 24:
@@ -128,9 +162,9 @@ def run_factor_regression(dataset: pd.DataFrame) -> tuple[pd.DataFrame, dict, np
     return coeff_table, metrics, fitted, results
 
 
-def build_reconstructed_history(results, portfolio_prices: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+def build_reconstructed_history(results, portfolio_prices: pd.DataFrame, factors: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
     factors = factors.copy()
-    x_full = sm.add_constant(factors[["Mkt-RF", "SMB", "HML"]], has_constant="add")
+    x_full = sm.add_constant(factors[factor_cols], has_constant="add")
     factors["PredExcess"] = results.predict(x_full)
     factors["PredReturn"] = factors["PredExcess"] + factors["RF"]
 
@@ -254,6 +288,7 @@ app.layout = html.Div(
         dcc.Graph(id="residuals-time"),
         dcc.Graph(id="cum-returns"),
         dcc.Graph(id="reconstructed-history"),
+        dcc.Graph(id="reconstructed-history-fx"),
     ],
 )
 
@@ -269,7 +304,7 @@ app.layout = html.Div(
 )
 def refresh_date_bounds(contents, factor_contents, factor_choice):
     try:
-        ds, _ = build_regression_dataset(contents, factor_contents, factor_choice)
+        ds, _, _ = build_regression_dataset(contents, factor_contents, factor_choice)
         min_date = ds["Date"].min().date()
         max_date = ds["Date"].max().date()
         return min_date, max_date, min_date, max_date
@@ -289,10 +324,37 @@ def show_selected_files(portfolio_filename, factor_filename, factor_choice):
         f"Selected portfolio file: {DEFAULT_PORTFOLIO_FILE.name} (default)"
     )
     if factor_choice == "uploaded":
-        factor_text = f"Selected factor file: {factor_filename}" if factor_filename else "Selected factor file: none"
+        factor_text = f"Selected factor file: {factor_filename} (active)" if factor_filename else "Selected factor file: none"
     else:
-        factor_text = f"Selected factor file: {FACTOR_FILE.name} (default)"
+        if factor_filename:
+            factor_text = f"Selected factor file: {FACTOR_FILE.name} (default active). Uploaded detected: {factor_filename}"
+        else:
+            factor_text = f"Selected factor file: {FACTOR_FILE.name} (default active)"
     return portfolio_text, factor_text
+
+
+@app.callback(
+    Output("factor-choice", "value"),
+    Input("factor-upload", "filename"),
+    State("factor-choice", "value"),
+    prevent_initial_call=True,
+)
+def auto_activate_uploaded_factor(factor_filename, current_choice):
+    if factor_filename:
+        return "uploaded"
+    return current_choice
+
+
+@app.callback(
+    Output("factor-choice", "options"),
+    Input("factor-upload", "filename"),
+)
+def update_factor_dropdown_options(factor_filename):
+    uploaded_label = f"Use uploaded: {factor_filename}" if factor_filename else "Use uploaded factor file"
+    return [
+        {"label": f"Default: {FACTOR_FILE.name}", "value": "default"},
+        {"label": uploaded_label, "value": "uploaded"},
+    ]
 
 
 @app.callback(
@@ -304,6 +366,7 @@ def show_selected_files(portfolio_filename, factor_filename, factor_choice):
     Output("residuals-time", "figure"),
     Output("cum-returns", "figure"),
     Output("reconstructed-history", "figure"),
+    Output("reconstructed-history-fx", "figure"),
     Output("result-store", "data"),
     Input("run-btn", "n_clicks"),
     State("portfolio-upload", "contents"),
@@ -316,14 +379,15 @@ def show_selected_files(portfolio_filename, factor_filename, factor_choice):
 def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_date):
     try:
         portfolio_prices = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
-        ds, factor_label = build_regression_dataset(contents, factor_contents, factor_choice)
+        ds, factor_label, factor_cols = build_regression_dataset(contents, factor_contents, factor_choice)
         factors = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)[0] if factor_choice == "uploaded" else load_ff3_factors(FACTOR_FILE)
+        fx_rates = load_usd_eur_monthly_rates(FX_FILE)
         if start_date and end_date:
             start = pd.to_datetime(start_date)
             end = pd.to_datetime(end_date)
             ds = ds[(ds["Date"] >= start) & (ds["Date"] <= end)].copy()
 
-        coeff_table, metrics, fitted, results = run_factor_regression(ds)
+        coeff_table, metrics, fitted, results = run_factor_regression(ds, factor_cols)
         ds["FittedExcess"] = fitted
         ds["Residual"] = ds["ExcessReturn"] - ds["FittedExcess"]
         ds["CumActualExcess"] = (1 + ds["ExcessReturn"]).cumprod() - 1
@@ -344,7 +408,7 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
         for col in ["Coefficient", "t-Stat", "p-Value"]:
             coef_out[col] = coef_out[col].map(lambda x: f"{x:.6f}")
 
-        exposure_df = coeff_table[coeff_table["Term"].isin(["Mkt-RF", "SMB", "HML"])]
+        exposure_df = coeff_table[coeff_table["Term"].isin(factor_cols)]
         exposure_fig = px.bar(exposure_df, x="Term", y="Coefficient", title="Factor Exposures (Betas)")
         exposure_fig.update_layout(template="plotly_white", height=360)
 
@@ -361,24 +425,60 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
         cum_fig.add_trace(go.Scatter(x=ds["Date"], y=ds["CumActualExcess"], mode="lines", name="Actual Excess"))
         cum_fig.add_trace(go.Scatter(x=ds["Date"], y=ds["CumFittedExcess"], mode="lines", name="Fitted Excess"))
         cum_fig.update_layout(title="Cumulative Excess Return: Actual vs Fitted", template="plotly_white", height=360)
+        cum_fig.update_yaxes(type="log")
 
-        reconstructed = build_reconstructed_history(results, portfolio_prices, factors)
+        reconstructed = build_reconstructed_history(results, portfolio_prices, factors, factor_cols)
         actual_series = portfolio_prices[["Date", "IndexLevel"]].sort_values("Date")
+
+        reconstructed = reconstructed.merge(fx_rates, on="Date", how="left")
+        actual_series = actual_series.merge(fx_rates, on="Date", how="left")
+        reconstructed["USDEUR"] = reconstructed["USDEUR"].ffill().bfill()
+        actual_series["USDEUR"] = actual_series["USDEUR"].ffill().bfill()
+        if reconstructed["USDEUR"].isna().any() or actual_series["USDEUR"].isna().any():
+            raise ValueError("Missing USD/EUR rates for one or more dates.")
+
+        reconstructed["ReconstructedLevelEUR"] = reconstructed["ReconstructedLevel"] * reconstructed["USDEUR"]
+        actual_series["IndexLevelEUR"] = actual_series["IndexLevel"] * actual_series["USDEUR"]
 
         recon_fig = go.Figure()
         recon_fig.add_trace(
-            go.Scatter(x=reconstructed["Date"], y=reconstructed["ReconstructedLevel"], mode="lines", name="Reconstructed")
+            go.Scatter(
+                x=reconstructed["Date"], y=reconstructed["ReconstructedLevel"], mode="lines", name="Reconstructed (USD)"
+            )
         )
-        recon_fig.add_trace(go.Scatter(x=actual_series["Date"], y=actual_series["IndexLevel"], mode="lines", name="Actual"))
+        recon_fig.add_trace(go.Scatter(x=actual_series["Date"], y=actual_series["IndexLevel"], mode="lines", name="Actual (USD)"))
         recon_fig.update_layout(
-            title="Extended Reconstructed Index History (Factor-Based Backcast)", template="plotly_white", height=420
+            title="Extended Reconstructed Index History (USD)", template="plotly_white", height=420
         )
+        recon_fig.update_yaxes(type="log")
+
+        recon_fx_fig = go.Figure()
+        recon_fx_fig.add_trace(
+            go.Scatter(
+                x=reconstructed["Date"], y=reconstructed["ReconstructedLevelEUR"], mode="lines", name="Reconstructed (EUR)"
+            )
+        )
+        recon_fx_fig.add_trace(
+            go.Scatter(
+                x=actual_series["Date"], y=actual_series["IndexLevelEUR"], mode="lines", name="Actual (EUR)"
+            )
+        )
+        recon_fx_fig.update_layout(
+            title="Extended Reconstructed Index History (EUR, Factor-Based Backcast)", template="plotly_white", height=420
+        )
+        recon_fx_fig.update_yaxes(type="log")
 
         result_export = ds[["Date", "PortfolioReturn", "ExcessReturn", "FittedExcess", "Residual"]].copy()
-        result_export = result_export.merge(reconstructed, on="Date", how="left")
+        result_export = result_export.merge(
+            reconstructed[["Date", "USDEUR", "ReconstructedLevel", "ReconstructedLevelEUR"]], on="Date", how="left"
+        )
         result_export["Date"] = result_export["Date"].dt.strftime("%Y-%m-%d")
 
-        status = f"Regression completed on {len(ds)} monthly observations. Factor source: {factor_label}."
+        status = (
+            f"Regression completed on {len(ds)} monthly observations. "
+            f"Factors used: {', '.join(factor_cols)}. "
+            f"Factor source: {factor_label}. Currency conversion: USD->EUR applied."
+        )
         return (
             status,
             cards,
@@ -388,12 +488,13 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
             residual_fig,
             cum_fig,
             recon_fig,
+            recon_fx_fig,
             result_export.to_dict("records"),
         )
     except Exception as exc:
         msg = f"Error: {exc}"
         empty = make_empty_figure("Run regression to see chart.")
-        return msg, [], [], empty, empty, empty, empty, empty, None
+        return msg, [], [], empty, empty, empty, empty, empty, empty, None
 
 
 @app.callback(
