@@ -468,7 +468,10 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
         )
         recon_fx_fig.update_yaxes(type="log")
 
-        result_export = ds[["Date", "PortfolioReturn"]].copy()
+        result_export = reconstructed[["Date", "ReconstructedLevelEUR"]].copy()
+        base_value = result_export["ReconstructedLevelEUR"].dropna().iloc[0]
+        result_export["ReconstructedLevelEUR"] = (result_export["ReconstructedLevelEUR"] / base_value) * 100.0
+        result_export = result_export.rename(columns={"ReconstructedLevelEUR": "CumulativePortfolioValueEUR"})
         result_export["Date"] = result_export["Date"].dt.strftime("%Y-%m-%d")
 
         status = (
