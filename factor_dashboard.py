@@ -468,10 +468,7 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
         )
         recon_fx_fig.update_yaxes(type="log")
 
-        result_export = ds[["Date", "PortfolioReturn", "ExcessReturn", "FittedExcess", "Residual"]].copy()
-        result_export = result_export.merge(
-            reconstructed[["Date", "USDEUR", "ReconstructedLevel", "ReconstructedLevelEUR"]], on="Date", how="left"
-        )
+        result_export = ds[["Date", "PortfolioReturn"]].copy()
         result_export["Date"] = result_export["Date"].dt.strftime("%Y-%m-%d")
 
         status = (
