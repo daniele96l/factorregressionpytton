@@ -110,6 +110,19 @@ def load_usd_eur_monthly_rates(path: Path) -> pd.DataFrame:
     return fx[["Date", "USDEUR"]]
 
 
+def load_usd_eur_monthly_rates_from_content(contents: str, fallback_path: Path) -> tuple[pd.DataFrame, str]:
+    if contents:
+        _, content_string = contents.split(",", 1)
+        decoded = base64.b64decode(content_string)
+        fx = pd.read_csv(io.StringIO(decoded.decode("utf-8")), usecols=["date", "rate"])
+        fx["Date"] = pd.to_datetime(fx["date"], errors="coerce") + pd.offsets.MonthEnd(0)
+        fx["USDEUR"] = pd.to_numeric(fx["rate"], errors="coerce")
+        fx = fx.dropna(subset=["Date", "USDEUR"]).sort_values("Date")
+        fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
+        return fx[["Date", "USDEUR"]], "Uploaded FX file"
+    return load_usd_eur_monthly_rates(fallback_path), fallback_path.name
+
+
 def build_regression_dataset(contents: str, factor_contents: str, factor_choice: str) -> tuple[pd.DataFrame, str, list[str]]:
     if factor_choice == "uploaded":
         factors, factor_label = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)
@@ -248,6 +261,22 @@ app.layout = html.Div(
             multiple=False,
         ),
         html.Div(id="factor-file-feedback", style={"marginBottom": "10px", "color": "#555"}),
+        dcc.Upload(
+            id="fx-upload",
+            children=html.Div(["Optional: upload USD/EUR CSV (date, rate)"]),
+            style={
+                "width": "100%",
+                "height": "48px",
+                "lineHeight": "48px",
+                "borderWidth": "1px",
+                "borderStyle": "dashed",
+                "borderRadius": "8px",
+                "textAlign": "center",
+                "marginBottom": "10px",
+            },
+            multiple=False,
+        ),
+        html.Div(id="fx-file-feedback", style={"marginBottom": "10px", "color": "#555"}),
         html.Div(
             style={"display": "flex", "gap": "10px", "alignItems": "center", "marginBottom": "10px"},
             children=[
@@ -260,6 +289,16 @@ app.layout = html.Div(
                     value="default",
                     clearable=False,
                     style={"minWidth": "300px"},
+                ),
+                dcc.Dropdown(
+                    id="fx-choice",
+                    options=[
+                        {"label": f"FX default: {FX_FILE.name}", "value": "default"},
+                        {"label": "Use uploaded FX file", "value": "uploaded"},
+                    ],
+                    value="default",
+                    clearable=False,
+                    style={"minWidth": "280px"},
                 ),
                 dcc.DatePickerRange(id="date-range", display_format="YYYY-MM-DD"),
                 html.Button("Run Regression", id="run-btn", n_clicks=0),
@@ -315,11 +354,14 @@ def refresh_date_bounds(contents, factor_contents, factor_choice):
 @app.callback(
     Output("portfolio-file-feedback", "children"),
     Output("factor-file-feedback", "children"),
+    Output("fx-file-feedback", "children"),
     Input("portfolio-upload", "filename"),
     Input("factor-upload", "filename"),
     Input("factor-choice", "value"),
+    Input("fx-upload", "filename"),
+    Input("fx-choice", "value"),
 )
-def show_selected_files(portfolio_filename, factor_filename, factor_choice):
+def show_selected_files(portfolio_filename, factor_filename, factor_choice, fx_filename, fx_choice):
     portfolio_text = f"Selected portfolio file: {portfolio_filename}" if portfolio_filename else (
         f"Selected portfolio file: {DEFAULT_PORTFOLIO_FILE.name} (default)"
     )
@@ -330,7 +372,14 @@ def show_selected_files(portfolio_filename, factor_filename, factor_choice):
             factor_text = f"Selected factor file: {FACTOR_FILE.name} (default active). Uploaded detected: {factor_filename}"
         else:
             factor_text = f"Selected factor file: {FACTOR_FILE.name} (default active)"
-    return portfolio_text, factor_text
+    if fx_choice == "uploaded":
+        fx_text = f"Selected FX file: {fx_filename} (active)" if fx_filename else "Selected FX file: none"
+    else:
+        if fx_filename:
+            fx_text = f"Selected FX file: {FX_FILE.name} (default active). Uploaded detected: {fx_filename}"
+        else:
+            fx_text = f"Selected FX file: {FX_FILE.name} (default active)"
+    return portfolio_text, factor_text, fx_text
 
 
 @app.callback(
@@ -346,6 +395,18 @@ def auto_activate_uploaded_factor(factor_filename, current_choice):
 
 
 @app.callback(
+    Output("fx-choice", "value"),
+    Input("fx-upload", "filename"),
+    State("fx-choice", "value"),
+    prevent_initial_call=True,
+)
+def auto_activate_uploaded_fx(fx_filename, current_choice):
+    if fx_filename:
+        return "uploaded"
+    return current_choice
+
+
+@app.callback(
     Output("factor-choice", "options"),
     Input("factor-upload", "filename"),
 )
@@ -353,6 +414,18 @@ def update_factor_dropdown_options(factor_filename):
     uploaded_label = f"Use uploaded: {factor_filename}" if factor_filename else "Use uploaded factor file"
     return [
         {"label": f"Default: {FACTOR_FILE.name}", "value": "default"},
+        {"label": uploaded_label, "value": "uploaded"},
+    ]
+
+
+@app.callback(
+    Output("fx-choice", "options"),
+    Input("fx-upload", "filename"),
+)
+def update_fx_dropdown_options(fx_filename):
+    uploaded_label = f"Use uploaded FX: {fx_filename}" if fx_filename else "Use uploaded FX file"
+    return [
+        {"label": f"FX default: {FX_FILE.name}", "value": "default"},
         {"label": uploaded_label, "value": "uploaded"},
     ]
 
@@ -372,16 +445,22 @@ def update_factor_dropdown_options(factor_filename):
     State("portfolio-upload", "contents"),
     State("factor-upload", "contents"),
     State("factor-choice", "value"),
+    State("fx-upload", "contents"),
+    State("fx-choice", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
     prevent_initial_call=True,
 )
-def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_date):
+def run_analysis(_, contents, factor_contents, factor_choice, fx_contents, fx_choice, start_date, end_date):
     try:
         portfolio_prices = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
         ds, factor_label, factor_cols = build_regression_dataset(contents, factor_contents, factor_choice)
         factors = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)[0] if factor_choice == "uploaded" else load_ff3_factors(FACTOR_FILE)
-        fx_rates = load_usd_eur_monthly_rates(FX_FILE)
+        fx_rates, fx_label = (
+            load_usd_eur_monthly_rates_from_content(fx_contents, FX_FILE)
+            if fx_choice == "uploaded"
+            else (load_usd_eur_monthly_rates(FX_FILE), FX_FILE.name)
+        )
         if start_date and end_date:
             start = pd.to_datetime(start_date)
             end = pd.to_datetime(end_date)
@@ -477,7 +556,7 @@ def run_analysis(_, contents, factor_contents, factor_choice, start_date, end_da
         status = (
             f"Regression completed on {len(ds)} monthly observations. "
             f"Factors used: {', '.join(factor_cols)}. "
-            f"Factor source: {factor_label}. Currency conversion: USD->EUR applied."
+            f"Factor source: {factor_label}. FX source: {fx_label}. Currency conversion: USD->EUR applied."
         )
         return (
             status,
