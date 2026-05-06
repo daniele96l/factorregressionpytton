@@ -142,43 +142,74 @@ def build_regression_dataset(contents: str, factor_contents: str, factor_choice:
     return merged, factor_label, factor_cols
 
 
-def run_factor_regression(dataset: pd.DataFrame, factor_cols: list[str]) -> tuple[pd.DataFrame, dict, np.ndarray, object]:
+def run_factor_regression(
+    dataset: pd.DataFrame, factor_cols: list[str], algo: str, ridge_alpha: float
+) -> tuple[pd.DataFrame, dict, np.ndarray, pd.Series]:
     x = dataset[factor_cols]
     y = dataset["ExcessReturn"]
 
     if len(dataset) < 24:
         raise ValueError("Not enough observations. Need at least 24 monthly points.")
 
-    x_const = sm.add_constant(x)
+    x_const = sm.add_constant(x, has_constant="add")
+    n_obs = len(y)
+    k = len(factor_cols)
+
+    if algo == "ridge":
+        x_mat = x_const.to_numpy()
+        y_mat = y.to_numpy()
+        i = np.eye(x_mat.shape[1])
+        i[0, 0] = 0.0  # do not penalize intercept
+        beta = np.linalg.solve(x_mat.T @ x_mat + float(ridge_alpha) * i, x_mat.T @ y_mat)
+        params = pd.Series(beta, index=x_const.columns)
+        fitted = x_mat @ beta
+        residuals = y_mat - fitted
+        sse = float(np.sum(residuals**2))
+        sst = float(np.sum((y_mat - np.mean(y_mat)) ** 2))
+        r2 = 1.0 - (sse / sst) if sst > 0 else np.nan
+        adj_r2 = 1.0 - (1.0 - r2) * (n_obs - 1) / (n_obs - k - 1) if n_obs > (k + 1) else np.nan
+        coeff_table = pd.DataFrame(
+            {"Term": params.index, "Coefficient": params.values, "t-Stat": np.nan, "p-Value": np.nan}
+        )
+        metrics = {
+            "Observations": int(n_obs),
+            "R-squared": float(r2) if pd.notna(r2) else np.nan,
+            "Adj R-squared": float(adj_r2) if pd.notna(adj_r2) else np.nan,
+            "RMSE": float(np.sqrt(np.mean(residuals**2))),
+            "Alpha (const)": float(params["const"]),
+        }
+        return coeff_table, metrics, fitted, params
+
     model = sm.OLS(y, x_const)
     results = model.fit()
     fitted = results.predict(x_const)
-
+    params = results.params
     coeff_table = pd.DataFrame(
         {
-            "Term": results.params.index,
-            "Coefficient": results.params.values,
+            "Term": params.index,
+            "Coefficient": params.values,
             "t-Stat": results.tvalues.values,
             "p-Value": results.pvalues.values,
         }
     )
-
     rmse = float(np.sqrt(np.mean((y - fitted) ** 2)))
     metrics = {
         "Observations": int(results.nobs),
         "R-squared": float(results.rsquared),
         "Adj R-squared": float(results.rsquared_adj),
         "RMSE": rmse,
-        "Alpha (const)": float(results.params["const"]),
+        "Alpha (const)": float(params["const"]),
     }
+    return coeff_table, metrics, fitted, params
 
-    return coeff_table, metrics, fitted, results
 
-
-def build_reconstructed_history(results, portfolio_prices: pd.DataFrame, factors: pd.DataFrame, factor_cols: list[str]) -> pd.DataFrame:
+def build_reconstructed_history(
+    params: pd.Series, portfolio_prices: pd.DataFrame, factors: pd.DataFrame, factor_cols: list[str]
+) -> pd.DataFrame:
     factors = factors.copy()
     x_full = sm.add_constant(factors[factor_cols], has_constant="add")
-    factors["PredExcess"] = results.predict(x_full)
+    ordered_params = params.reindex(x_full.columns).fillna(0.0).to_numpy()
+    factors["PredExcess"] = x_full.to_numpy() @ ordered_params
     factors["PredReturn"] = factors["PredExcess"] + factors["RF"]
 
     anchor_row = portfolio_prices.dropna(subset=["Date", "IndexLevel"]).sort_values("Date").iloc[0]
@@ -299,6 +330,26 @@ app.layout = html.Div(
                     value="default",
                     clearable=False,
                     style={"minWidth": "280px"},
+                ),
+                dcc.Dropdown(
+                    id="regression-algo",
+                    options=[
+                        {"label": "OLS", "value": "ols"},
+                        {"label": "Ridge (L2)", "value": "ridge"},
+                    ],
+                    value="ols",
+                    clearable=False,
+                    style={"minWidth": "180px"},
+                ),
+                dcc.Input(
+                    id="ridge-alpha",
+                    type="number",
+                    value=1.0,
+                    min=0.0,
+                    step=0.1,
+                    debounce=True,
+                    placeholder="Ridge alpha",
+                    style={"width": "130px"},
                 ),
                 dcc.DatePickerRange(id="date-range", display_format="YYYY-MM-DD"),
                 html.Button("Run Regression", id="run-btn", n_clicks=0),
@@ -447,11 +498,15 @@ def update_fx_dropdown_options(fx_filename):
     State("factor-choice", "value"),
     State("fx-upload", "contents"),
     State("fx-choice", "value"),
+    State("regression-algo", "value"),
+    State("ridge-alpha", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
     prevent_initial_call=True,
 )
-def run_analysis(_, contents, factor_contents, factor_choice, fx_contents, fx_choice, start_date, end_date):
+def run_analysis(
+    _, contents, factor_contents, factor_choice, fx_contents, fx_choice, regression_algo, ridge_alpha, start_date, end_date
+):
     try:
         portfolio_prices = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
         ds, factor_label, factor_cols = build_regression_dataset(contents, factor_contents, factor_choice)
@@ -466,7 +521,9 @@ def run_analysis(_, contents, factor_contents, factor_choice, fx_contents, fx_ch
             end = pd.to_datetime(end_date)
             ds = ds[(ds["Date"] >= start) & (ds["Date"] <= end)].copy()
 
-        coeff_table, metrics, fitted, results = run_factor_regression(ds, factor_cols)
+        coeff_table, metrics, fitted, params = run_factor_regression(
+            ds, factor_cols, regression_algo or "ols", ridge_alpha if ridge_alpha is not None else 1.0
+        )
         ds["FittedExcess"] = fitted
         ds["Residual"] = ds["ExcessReturn"] - ds["FittedExcess"]
         ds["CumActualExcess"] = (1 + ds["ExcessReturn"]).cumprod() - 1
@@ -504,9 +561,8 @@ def run_analysis(_, contents, factor_contents, factor_choice, fx_contents, fx_ch
         cum_fig.add_trace(go.Scatter(x=ds["Date"], y=ds["CumActualExcess"], mode="lines", name="Actual Excess"))
         cum_fig.add_trace(go.Scatter(x=ds["Date"], y=ds["CumFittedExcess"], mode="lines", name="Fitted Excess"))
         cum_fig.update_layout(title="Cumulative Excess Return: Actual vs Fitted", template="plotly_white", height=360)
-        cum_fig.update_yaxes(type="log")
 
-        reconstructed = build_reconstructed_history(results, portfolio_prices, factors, factor_cols)
+        reconstructed = build_reconstructed_history(params, portfolio_prices, factors, factor_cols)
         actual_series = portfolio_prices[["Date", "IndexLevel"]].sort_values("Date")
 
         reconstructed = reconstructed.merge(fx_rates, on="Date", how="left")
@@ -555,6 +611,7 @@ def run_analysis(_, contents, factor_contents, factor_choice, fx_contents, fx_ch
 
         status = (
             f"Regression completed on {len(ds)} monthly observations. "
+            f"Algorithm: {(regression_algo or 'ols').upper()}. "
             f"Factors used: {', '.join(factor_cols)}. "
             f"Factor source: {factor_label}. FX source: {fx_label}. Currency conversion: USD->EUR applied."
         )
