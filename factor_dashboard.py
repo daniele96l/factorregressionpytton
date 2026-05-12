@@ -23,6 +23,33 @@ DEFAULT_PORTFOLIO_COLUMN = "MSCI USA Small Cap Value Weighted"
 FX_FILE = Path(__file__).resolve().parent / "usd_eur_rate_rows.csv"
 
 
+def _combined_positive_y_range(*series: pd.Series) -> list[float] | None:
+    parts = [pd.to_numeric(s, errors="coerce") for s in series]
+    vals = pd.concat(parts, ignore_index=True).replace([np.inf, -np.inf], np.nan).dropna()
+    vals = vals[vals > 0]
+    if len(vals) == 0:
+        return None
+    lo, hi = float(vals.min()), float(vals.max())
+    if abs(hi - lo) < 1e-9 * max(hi, 1.0):
+        hi = lo * 1.05
+    pad = 0.05 * (hi - lo)
+    return [lo - pad, hi + pad]
+
+
+def _yaxis_for_index_chart(*series: pd.Series) -> dict:
+    yaxis: dict = {
+        "type": "linear",
+        "tickformat": ",.0f",
+        "automargin": True,
+        "showexponent": "none",
+        "nticks": 10,
+    }
+    rng = _combined_positive_y_range(*series)
+    if rng is not None:
+        yaxis["range"] = rng
+    return yaxis
+
+
 def parse_ff3_factors(raw: pd.DataFrame, daily: bool = False) -> pd.DataFrame:
     raw = raw.rename(columns={raw.columns[0]: "Date"})
     raw["Date"] = raw["Date"].astype(str).str.strip()
@@ -149,29 +176,58 @@ def load_usd_eur_rates_from_content(contents: str, fallback_path: Path, daily: b
     return load_usd_eur_rates(fallback_path, daily=daily), fallback_path.name
 
 
+def _compound_factors_over_portfolio_periods(portfolio: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+    """One row per portfolio return: compound daily factor columns between consecutive portfolio dates."""
+    ps = portfolio.sort_values("Date").reset_index(drop=True)
+    fac = factors.sort_values("Date")
+    fac_cols = [c for c in ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"] if c in fac.columns]
+    rows: list[dict] = []
+    for i in range(1, len(ps)):
+        t0 = ps.loc[i - 1, "Date"]
+        t1 = ps.loc[i, "Date"]
+        pr = float(ps.loc[i, "IndexLevel"] / ps.loc[i - 1, "IndexLevel"] - 1.0)
+        chunk = fac[(fac["Date"] > t0) & (fac["Date"] <= t1)]
+        if chunk.empty:
+            continue
+        row: dict = {"Date": t1, "IndexLevel": float(ps.loc[i, "IndexLevel"]), "PortfolioReturn": pr}
+        for c in fac_cols:
+            row[c] = float((1.0 + chunk[c].astype(float)).prod() - 1.0)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def build_regression_dataset(
     contents: str, factor_contents: str, factor_choice: str, daily: bool = False
-) -> tuple[pd.DataFrame, str, list[str]]:
+) -> tuple[pd.DataFrame, str, list[str], str | None]:
     if factor_choice == "uploaded":
         factors, factor_label = load_ff3_factors_from_content(factor_contents, FACTOR_FILE, daily=daily)
     else:
         factors, factor_label = load_ff3_factors(FACTOR_FILE, daily=daily), FACTOR_FILE.name
     portfolio = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
 
+    daily_merge_path: str | None = None
     if not daily:
         portfolio = portfolio.copy()
         portfolio["PortfolioReturn"] = portfolio["IndexLevel"].pct_change()
         portfolio = portfolio.dropna(subset=["PortfolioReturn"])
         merged = portfolio.merge(factors, on="Date", how="inner")
     else:
-        merged = pd.merge_asof(
-            factors.sort_values("Date"),
-            portfolio.sort_values("Date")[["Date", "IndexLevel"]],
-            on="Date",
-            direction="backward",
-        )
-        merged["PortfolioReturn"] = merged["IndexLevel"].pct_change()
-        merged = merged.dropna(subset=["IndexLevel"])
+        pgaps = portfolio["Date"].sort_values().diff().dt.days.dropna()
+        median_gap = float(pgaps.median()) if len(pgaps) else 0.0
+        monthly_like = median_gap > 5.0
+        if monthly_like:
+            daily_merge_path = "monthly_ends"
+            merged = _compound_factors_over_portfolio_periods(portfolio, factors)
+        else:
+            daily_merge_path = "full_calendar"
+            merged = pd.merge_asof(
+                factors.sort_values("Date"),
+                portfolio.sort_values("Date")[["Date", "IndexLevel"]],
+                on="Date",
+                direction="backward",
+            )
+            merged["PortfolioReturn"] = merged["IndexLevel"].pct_change()
+            merged = merged.dropna(subset=["IndexLevel"])
 
     if merged.empty:
         raise ValueError("No overlapping dates between portfolio and factor data.")
@@ -179,7 +235,7 @@ def build_regression_dataset(
     factor_cols = [c for c in ["Mkt-RF", "SMB", "HML", "RMW", "CMA"] if c in merged.columns]
     merged["ExcessReturn"] = merged["PortfolioReturn"] - merged["RF"]
     merged = merged.dropna(subset=["ExcessReturn", *factor_cols]).sort_values("Date")
-    return merged, factor_label, factor_cols
+    return merged, factor_label, factor_cols, daily_merge_path
 
 
 def run_factor_regression(
@@ -188,11 +244,13 @@ def run_factor_regression(
     algo: str,
     ridge_alpha: float,
     daily: bool = False,
+    min_obs: int | None = None,
 ) -> tuple[pd.DataFrame, dict, np.ndarray, pd.Series]:
     x = dataset[factor_cols]
     y = dataset["ExcessReturn"]
 
-    min_obs = 252 if daily else 24
+    if min_obs is None:
+        min_obs = 252 if daily else 24
     if len(dataset) < min_obs:
         unit = "daily" if daily else "monthly"
         raise ValueError(f"Not enough observations. Need at least {min_obs} {unit} points.")
@@ -252,46 +310,74 @@ def run_factor_regression(
 def build_reconstructed_history(
     params: pd.Series, portfolio_prices: pd.DataFrame, factors: pd.DataFrame, factor_cols: list[str]
 ) -> pd.DataFrame:
-    factors = factors.copy()
+    """Extend synthetic index along the full `factors` timeline (every daily/monthly factor row)."""
+    factors = (
+        factors.copy()
+        .sort_values("Date")
+        .drop_duplicates(subset=["Date"], keep="last")
+        .reset_index(drop=True)
+    )
     x_full = sm.add_constant(factors[factor_cols], has_constant="add")
     ordered_params = params.reindex(x_full.columns).fillna(0.0).to_numpy()
     factors["PredExcess"] = x_full.to_numpy() @ ordered_params
     factors["PredReturn"] = factors["PredExcess"] + factors["RF"]
 
-    factor_dates = set(factors["Date"].tolist())
-    overlapping_portfolio = portfolio_prices[portfolio_prices["Date"].isin(factor_dates)].dropna(subset=["Date", "IndexLevel"]).sort_values("Date")
-    if overlapping_portfolio.empty:
-        raise ValueError("No overlapping portfolio date found in factor timeline for reconstruction anchor.")
-    anchor_row = overlapping_portfolio.iloc[0]
-    anchor_date = anchor_row["Date"]
-    anchor_level = float(anchor_row["IndexLevel"])
+    ps = portfolio_prices.dropna(subset=["Date", "IndexLevel"]).sort_values("Date")
+    if ps.empty:
+        raise ValueError("Portfolio is empty.")
+    first_date = ps["Date"].iloc[0]
+    anchor_level = float(ps["IndexLevel"].iloc[0])
+    mask = factors["Date"] <= first_date
+    if not mask.any():
+        raise ValueError("No factor observations on or before the first portfolio date.")
+    anchor_pos = int(np.flatnonzero(mask.to_numpy())[-1])
 
-    factors = factors.sort_values("Date").copy()
-    factors["ReconstructedLevel"] = np.nan
-    anchor_idx = factors.index[factors["Date"] == anchor_date]
-    if len(anchor_idx) == 0:
-        raise ValueError("Anchor date not found in factor timeline.")
-    anchor_idx = anchor_idx[0]
-    factors.loc[anchor_idx, "ReconstructedLevel"] = anchor_level
-
-    idx_positions = list(factors.index)
-    anchor_pos = idx_positions.index(anchor_idx)
-
-    for i in range(anchor_pos + 1, len(idx_positions)):
-        prev_idx = idx_positions[i - 1]
-        curr_idx = idx_positions[i]
-        factors.loc[curr_idx, "ReconstructedLevel"] = factors.loc[prev_idx, "ReconstructedLevel"] * (
-            1 + factors.loc[curr_idx, "PredReturn"]
-        )
-
+    pred = factors["PredReturn"].to_numpy(dtype=float)
+    n = len(factors)
+    levels = np.full(n, np.nan, dtype=float)
+    levels[anchor_pos] = anchor_level
+    for i in range(anchor_pos + 1, n):
+        levels[i] = levels[i - 1] * (1.0 + pred[i])
     for i in range(anchor_pos - 1, -1, -1):
-        curr_idx = idx_positions[i]
-        next_idx = idx_positions[i + 1]
-        factors.loc[curr_idx, "ReconstructedLevel"] = factors.loc[next_idx, "ReconstructedLevel"] / (
-            1 + factors.loc[next_idx, "PredReturn"]
-        )
-
+        levels[i] = levels[i + 1] / (1.0 + pred[i + 1])
+    factors["ReconstructedLevel"] = levels
     return factors[["Date", "ReconstructedLevel"]]
+
+
+def _reconstructed_sparse_monthly_ends(ds: pd.DataFrame, portfolio_prices: pd.DataFrame) -> pd.DataFrame:
+    """Levels on regression dates only, using the same implied returns the OLS fit used (FittedExcess + RF)."""
+    m = ds.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+    m["PredReturn"] = m["FittedExcess"] + m["RF"]
+    ps = portfolio_prices.dropna(subset=["Date", "IndexLevel"]).sort_values("Date")
+    if ps.empty:
+        raise ValueError("Portfolio is empty.")
+    first_pf = ps.iloc[0]
+    mask = m["Date"] <= first_pf["Date"]
+    if not mask.any():
+        anchor_pos = 0
+    else:
+        anchor_pos = int(np.flatnonzero(mask.to_numpy())[-1])
+    anchor_level = float(first_pf["IndexLevel"])
+    pr = m["PredReturn"].to_numpy(dtype=float)
+    n = len(m)
+    levels = np.full(n, np.nan, dtype=float)
+    levels[anchor_pos] = anchor_level
+    for i in range(anchor_pos + 1, n):
+        levels[i] = levels[i - 1] * (1.0 + pr[i])
+    for j in range(anchor_pos - 1, -1, -1):
+        levels[j] = levels[j + 1] / (1.0 + pr[j + 1])
+    return pd.DataFrame({"Date": m["Date"], "ReconstructedLevel": levels})
+
+
+def _expand_reconstructed_linear_to_factor_dates(sparse: pd.DataFrame, factor_dates: pd.Series) -> pd.DataFrame:
+    """Map sparse month-end levels onto every factor calendar date (time-linear interpolation)."""
+    idx = pd.DatetimeIndex(pd.Series(factor_dates.unique()).sort_values())
+    s = sparse.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").set_index("Date")["ReconstructedLevel"]
+    out = s.reindex(idx)
+    out = out.interpolate(method="time").ffill().bfill()
+    df = out.reset_index()
+    df.columns = ["Date", "ReconstructedLevel"]
+    return df
 
 
 def make_empty_figure(message: str) -> go.Figure:
@@ -502,7 +588,7 @@ app.layout = html.Div(
 def refresh_date_bounds(contents, factor_contents, factor_choice, frequency_mode):
     try:
         daily = frequency_mode == "daily"
-        ds, _, _ = build_regression_dataset(contents, factor_contents, factor_choice, daily=daily)
+        ds, _, _, _ = build_regression_dataset(contents, factor_contents, factor_choice, daily=daily)
         min_date = ds["Date"].min().date()
         max_date = ds["Date"].max().date()
         return min_date, max_date, min_date, max_date
@@ -614,7 +700,7 @@ def update_fx_dropdown_options(fx_filename):
     prevent_initial_call=True,
 )
 def run_analysis(
-    _,
+    n_clicks,
     contents,
     factor_contents,
     factor_choice,
@@ -629,7 +715,7 @@ def run_analysis(
     try:
         daily = frequency_mode == "daily"
         portfolio_prices = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
-        ds, factor_label, factor_cols = build_regression_dataset(
+        ds, factor_label, factor_cols, daily_merge_path = build_regression_dataset(
             contents, factor_contents, factor_choice, daily=daily
         )
         factors = (
@@ -647,12 +733,20 @@ def run_analysis(
             end = pd.to_datetime(end_date)
             ds = ds[(ds["Date"] >= start) & (ds["Date"] <= end)].copy()
 
+        if not daily:
+            reg_min_obs = None
+        elif daily_merge_path == "full_calendar":
+            reg_min_obs = 252
+        else:
+            reg_min_obs = 24
+
         coeff_table, metrics, fitted, params = run_factor_regression(
             ds,
             factor_cols,
             regression_algo or "ols",
             ridge_alpha if ridge_alpha is not None else 1.0,
             daily=daily,
+            min_obs=reg_min_obs,
         )
         ds["FittedExcess"] = fitted
         ds["Residual"] = ds["ExcessReturn"] - ds["FittedExcess"]
@@ -692,18 +786,36 @@ def run_analysis(
         cum_fig.add_trace(go.Scatter(x=ds["Date"], y=ds["CumFittedExcess"], mode="lines", name="Fitted Excess"))
         cum_fig.update_layout(title="Cumulative Excess Return: Actual vs Fitted", template="plotly_white", height=360)
 
-        reconstructed = build_reconstructed_history(params, portfolio_prices, factors, factor_cols)
+        if daily_merge_path == "monthly_ends":
+            sparse = _reconstructed_sparse_monthly_ends(ds, portfolio_prices)
+            reconstructed = _expand_reconstructed_linear_to_factor_dates(sparse, factors["Date"])
+        else:
+            reconstructed = build_reconstructed_history(params, portfolio_prices, factors, factor_cols)
         actual_series = portfolio_prices[["Date", "IndexLevel"]].sort_values("Date")
 
         reconstructed = reconstructed.merge(fx_rates, on="Date", how="left")
         actual_series = actual_series.merge(fx_rates, on="Date", how="left")
         reconstructed["USDEUR"] = reconstructed["USDEUR"].ffill().bfill()
         actual_series["USDEUR"] = actual_series["USDEUR"].ffill().bfill()
+        reconstructed = reconstructed.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+        actual_series = actual_series.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
         if reconstructed["USDEUR"].isna().any() or actual_series["USDEUR"].isna().any():
             raise ValueError("Missing USD/EUR rates for one or more dates.")
 
         reconstructed["ReconstructedLevelEUR"] = reconstructed["ReconstructedLevel"] * reconstructed["USDEUR"]
         actual_series["IndexLevelEUR"] = actual_series["IndexLevel"] * actual_series["USDEUR"]
+
+        # Align actual (monthly) levels to every reconstructed (daily) date for chart overlay.
+        actual_plot = pd.merge_asof(
+            reconstructed[["Date"]].sort_values("Date"),
+            actual_series.sort_values("Date"),
+            on="Date",
+            direction="backward",
+        )
+        for col in ("IndexLevel", "USDEUR"):
+            if actual_plot[col].isna().any():
+                actual_plot[col] = actual_plot[col].bfill().ffill()
+        actual_plot["IndexLevelEUR"] = actual_plot["IndexLevel"] * actual_plot["USDEUR"]
 
         recon_fig = go.Figure()
         recon_fig.add_trace(
@@ -711,11 +823,22 @@ def run_analysis(
                 x=reconstructed["Date"], y=reconstructed["ReconstructedLevel"], mode="lines", name="Reconstructed (USD)"
             )
         )
-        recon_fig.add_trace(go.Scatter(x=actual_series["Date"], y=actual_series["IndexLevel"], mode="lines", name="Actual (USD)"))
-        recon_fig.update_layout(
-            title="Extended Reconstructed Index History (USD)", template="plotly_white", height=420
+        recon_fig.add_trace(
+            go.Scatter(
+                x=actual_plot["Date"], y=actual_plot["IndexLevel"], mode="lines", name="Actual (USD)"
+            )
         )
-        recon_fig.update_yaxes(type="log")
+        recon_fig.update_layout(
+            title="Extended Reconstructed Index History (USD)",
+            template="plotly_white",
+            height=420,
+            margin=dict(l=72, r=24, t=56, b=48),
+            yaxis=_yaxis_for_index_chart(
+                reconstructed["ReconstructedLevel"],
+                actual_plot["IndexLevel"],
+            ),
+            uirevision=f"recon-usd-{int(n_clicks or 0)}",
+        )
 
         recon_fx_fig = go.Figure()
         recon_fx_fig.add_trace(
@@ -725,13 +848,20 @@ def run_analysis(
         )
         recon_fx_fig.add_trace(
             go.Scatter(
-                x=actual_series["Date"], y=actual_series["IndexLevelEUR"], mode="lines", name="Actual (EUR)"
+                x=actual_plot["Date"], y=actual_plot["IndexLevelEUR"], mode="lines", name="Actual (EUR)"
             )
         )
         recon_fx_fig.update_layout(
-            title="Extended Reconstructed Index History (EUR, Factor-Based Backcast)", template="plotly_white", height=420
+            title="Extended Reconstructed Index History (EUR, Factor-Based Backcast)",
+            template="plotly_white",
+            height=420,
+            margin=dict(l=72, r=24, t=56, b=48),
+            yaxis=_yaxis_for_index_chart(
+                reconstructed["ReconstructedLevelEUR"],
+                actual_plot["IndexLevelEUR"],
+            ),
+            uirevision=f"recon-eur-{int(n_clicks or 0)}",
         )
-        recon_fx_fig.update_yaxes(type="log")
 
         result_export = reconstructed[["Date", "ReconstructedLevelEUR"]].copy()
         base_value = result_export["ReconstructedLevelEUR"].dropna().iloc[0]
@@ -739,13 +869,25 @@ def run_analysis(
         result_export = result_export.rename(columns={"ReconstructedLevelEUR": "CumulativePortfolioValueEUR"})
         result_export["Date"] = result_export["Date"].dt.strftime("%Y-%m-%d")
 
-        freq_label = "daily" if daily else "monthly"
-        extra = (
-            " Portfolio levels are as-of merged to factor dates (forward-filled from last observation); "
-            "with a monthly portfolio file, most daily returns are zero except around level updates."
-            if daily
-            else ""
-        )
+        if daily and daily_merge_path == "monthly_ends":
+            freq_label = "daily factors (compounded per portfolio period)"
+        elif daily:
+            freq_label = "daily"
+        else:
+            freq_label = "monthly"
+        if daily and daily_merge_path == "monthly_ends":
+            extra = (
+                " Monthly portfolio: each month-to-month return is regressed on the same-period "
+                "factor premia, by compounding daily factor (and RF) returns between consecutive portfolio dates. "
+                "Reconstructed index uses fitted month-end returns, then linear time interpolation to the factor calendar."
+            )
+        elif daily and daily_merge_path == "full_calendar":
+            extra = (
+                " Portfolio levels are as-of merged to every factor date; with a sparse portfolio file, "
+                "many daily portfolio returns can be near zero."
+            )
+        else:
+            extra = ""
         status = (
             f"Regression completed on {len(ds)} {freq_label} observations. "
             f"Algorithm: {(regression_algo or 'ols').upper()}. "
