@@ -817,25 +817,60 @@ def run_analysis(
                 actual_plot[col] = actual_plot[col].bfill().ffill()
         actual_plot["IndexLevelEUR"] = actual_plot["IndexLevel"] * actual_plot["USDEUR"]
 
+        plot_chart = pd.DataFrame(
+            {
+                "Date": reconstructed["Date"].to_numpy(),
+                "ReconstructedLevel": reconstructed["ReconstructedLevel"].to_numpy(dtype=float),
+                "ActualLevel": actual_plot["IndexLevel"].to_numpy(dtype=float),
+                "ReconstructedLevelEUR": reconstructed["ReconstructedLevelEUR"].to_numpy(dtype=float),
+                "ActualLevelEUR": actual_plot["IndexLevelEUR"].to_numpy(dtype=float),
+            }
+        )
+        ok = (
+            plot_chart["ReconstructedLevel"].notna()
+            & plot_chart["ActualLevel"].notna()
+            & plot_chart["ReconstructedLevelEUR"].notna()
+            & plot_chart["ActualLevelEUR"].notna()
+        )
+        ok &= plot_chart["ReconstructedLevel"].gt(0) & plot_chart["ActualLevel"].gt(0)
+        ok &= plot_chart["ReconstructedLevelEUR"].gt(0) & plot_chart["ActualLevelEUR"].gt(0)
+        if not ok.any():
+            raise ValueError("Cannot normalize reconstruction chart: no overlapping positive levels.")
+        i0 = int(ok.to_numpy().argmax())
+        br = float(plot_chart["ReconstructedLevel"].iloc[i0])
+        ba = float(plot_chart["ActualLevel"].iloc[i0])
+        be = float(plot_chart["ReconstructedLevelEUR"].iloc[i0])
+        ae = float(plot_chart["ActualLevelEUR"].iloc[i0])
+        plot_chart["ReconUSDIdx"] = 100.0 * plot_chart["ReconstructedLevel"] / br
+        plot_chart["ActualUSDIdx"] = 100.0 * plot_chart["ActualLevel"] / ba
+        plot_chart["ReconEURIdx"] = 100.0 * plot_chart["ReconstructedLevelEUR"] / be
+        plot_chart["ActualEURIdx"] = 100.0 * plot_chart["ActualLevelEUR"] / ae
+
         recon_fig = go.Figure()
         recon_fig.add_trace(
             go.Scatter(
-                x=reconstructed["Date"], y=reconstructed["ReconstructedLevel"], mode="lines", name="Reconstructed (USD)"
+                x=plot_chart["Date"],
+                y=plot_chart["ReconUSDIdx"],
+                mode="lines",
+                name="Reconstructed (USD)",
             )
         )
         recon_fig.add_trace(
             go.Scatter(
-                x=actual_plot["Date"], y=actual_plot["IndexLevel"], mode="lines", name="Actual (USD)"
+                x=plot_chart["Date"],
+                y=plot_chart["ActualUSDIdx"],
+                mode="lines",
+                name="Actual (USD)",
             )
         )
         recon_fig.update_layout(
-            title="Extended Reconstructed Index History (USD)",
+            title="Extended Reconstructed Index History (USD, normalized to 100)",
             template="plotly_white",
             height=420,
             margin=dict(l=72, r=24, t=56, b=48),
-            yaxis=_yaxis_for_index_chart(
-                reconstructed["ReconstructedLevel"],
-                actual_plot["IndexLevel"],
+            yaxis=dict(
+                **_yaxis_for_index_chart(plot_chart["ReconUSDIdx"], plot_chart["ActualUSDIdx"]),
+                title="Index (start = 100)",
             ),
             uirevision=f"recon-usd-{int(n_clicks or 0)}",
         )
@@ -843,22 +878,28 @@ def run_analysis(
         recon_fx_fig = go.Figure()
         recon_fx_fig.add_trace(
             go.Scatter(
-                x=reconstructed["Date"], y=reconstructed["ReconstructedLevelEUR"], mode="lines", name="Reconstructed (EUR)"
+                x=plot_chart["Date"],
+                y=plot_chart["ReconEURIdx"],
+                mode="lines",
+                name="Reconstructed (EUR)",
             )
         )
         recon_fx_fig.add_trace(
             go.Scatter(
-                x=actual_plot["Date"], y=actual_plot["IndexLevelEUR"], mode="lines", name="Actual (EUR)"
+                x=plot_chart["Date"],
+                y=plot_chart["ActualEURIdx"],
+                mode="lines",
+                name="Actual (EUR)",
             )
         )
         recon_fx_fig.update_layout(
-            title="Extended Reconstructed Index History (EUR, Factor-Based Backcast)",
+            title="Extended Reconstructed Index History (EUR, normalized to 100)",
             template="plotly_white",
             height=420,
             margin=dict(l=72, r=24, t=56, b=48),
-            yaxis=_yaxis_for_index_chart(
-                reconstructed["ReconstructedLevelEUR"],
-                actual_plot["IndexLevelEUR"],
+            yaxis=dict(
+                **_yaxis_for_index_chart(plot_chart["ReconEURIdx"], plot_chart["ActualEURIdx"]),
+                title="Index (start = 100)",
             ),
             uirevision=f"recon-eur-{int(n_clicks or 0)}",
         )
