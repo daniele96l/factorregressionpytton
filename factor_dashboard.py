@@ -23,7 +23,7 @@ DEFAULT_PORTFOLIO_COLUMN = "MSCI USA Small Cap Value Weighted"
 FX_FILE = Path(__file__).resolve().parent / "usd_eur_rate_rows.csv"
 
 
-def parse_ff3_factors(raw: pd.DataFrame) -> pd.DataFrame:
+def parse_ff3_factors(raw: pd.DataFrame, daily: bool = False) -> pd.DataFrame:
     raw = raw.rename(columns={raw.columns[0]: "Date"})
     raw["Date"] = raw["Date"].astype(str).str.strip()
     monthly_rows = raw[raw["Date"].str.fullmatch(r"\d{6}", na=False)].copy()
@@ -32,6 +32,15 @@ def parse_ff3_factors(raw: pd.DataFrame) -> pd.DataFrame:
     base_cols = ["Mkt-RF", "SMB", "HML", "RF"]
     optional_cols = [c for c in ["RMW", "CMA"] if c in raw.columns]
     cols = [*base_cols[:-1], *optional_cols, "RF"]
+
+    if daily:
+        if daily_rows.empty:
+            raise ValueError("Daily mode needs a daily Fama-French file (YYYYMMDD dates).")
+        daily_rows["Date"] = pd.to_datetime(daily_rows["Date"], format="%Y%m%d", errors="coerce")
+        for col in cols:
+            daily_rows[col] = pd.to_numeric(daily_rows[col], errors="coerce") / 100.0
+        daily_rows = daily_rows.dropna(subset=["Date", *cols]).sort_values("Date")
+        return daily_rows[["Date", *cols]]
 
     if not monthly_rows.empty:
         monthly_rows["Date"] = pd.to_datetime(monthly_rows["Date"], format="%Y%m") + pd.offsets.MonthEnd(0)
@@ -59,25 +68,28 @@ def parse_ff3_factors(raw: pd.DataFrame) -> pd.DataFrame:
     raise ValueError("Factor file format not recognized: expected YYYYMM or YYYYMMDD dates.")
 
 
-def load_ff3_factors(path: Path) -> pd.DataFrame:
+def load_ff3_factors(path: Path, daily: bool = False) -> pd.DataFrame:
     raw = pd.read_csv(path, skiprows=4)
-    return parse_ff3_factors(raw)
+    return parse_ff3_factors(raw, daily=daily)
 
 
-def load_ff3_factors_from_content(contents: str, fallback_path: Path) -> tuple[pd.DataFrame, str]:
+def load_ff3_factors_from_content(contents: str, fallback_path: Path, daily: bool = False) -> tuple[pd.DataFrame, str]:
     if contents:
         _, content_string = contents.split(",", 1)
         decoded = base64.b64decode(content_string)
         raw = pd.read_csv(io.StringIO(decoded.decode("utf-8")), skiprows=4)
-        return parse_ff3_factors(raw), "Uploaded factor file"
-    return load_ff3_factors(fallback_path), fallback_path.name
+        return parse_ff3_factors(raw, daily=daily), "Uploaded factor file"
+    return load_ff3_factors(fallback_path, daily=daily), fallback_path.name
 
 
 def load_portfolio_prices_from_content(contents: str, fallback_path: Path) -> pd.DataFrame:
     if contents:
         _, content_string = contents.split(",", 1)
         decoded = base64.b64decode(content_string)
-        df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
+        try:
+            df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.StringIO(decoded.decode("latin-1")))
     else:
         df = pd.read_csv(fallback_path)
 
@@ -94,45 +106,73 @@ def load_portfolio_prices_from_content(contents: str, fallback_path: Path) -> pd
 
     out = df[["Date", portfolio_col]].copy()
     out = out.rename(columns={portfolio_col: "IndexLevel"})
-    out["Date"] = pd.to_datetime(out["Date"], format="%m/%Y", errors="coerce") + pd.offsets.MonthEnd(0)
-    out["IndexLevel"] = pd.to_numeric(out["IndexLevel"], errors="coerce")
+    date_raw = out["Date"].astype(str).str.strip()
+    parsed_date = (
+        pd.to_datetime(date_raw, format="%m/%Y", errors="coerce")
+        .fillna(pd.to_datetime(date_raw, format="%Y-%m-%d", errors="coerce"))
+        .fillna(pd.to_datetime(date_raw, format="%Y%m", errors="coerce"))
+        .fillna(pd.to_datetime(date_raw, format="%d/%m/%Y", errors="coerce"))
+    )
+    out["Date"] = parsed_date + pd.offsets.MonthEnd(0)
+    out["IndexLevel"] = pd.to_numeric(out["IndexLevel"].astype(str).str.replace(",", "", regex=False), errors="coerce")
     out = out.dropna(subset=["Date", "IndexLevel"]).sort_values("Date")
+    if out.empty:
+        raise ValueError("Portfolio CSV parsed but no valid date/value rows were found.")
     return out
 
 
-def load_usd_eur_monthly_rates(path: Path) -> pd.DataFrame:
+def load_usd_eur_rates(path: Path, daily: bool = False) -> pd.DataFrame:
     fx = pd.read_csv(path, usecols=["date", "rate"])
-    fx["Date"] = pd.to_datetime(fx["date"], errors="coerce") + pd.offsets.MonthEnd(0)
+    fx["Date"] = pd.to_datetime(fx["date"], errors="coerce")
+    if not daily:
+        fx["Date"] = fx["Date"] + pd.offsets.MonthEnd(0)
     fx["USDEUR"] = pd.to_numeric(fx["rate"], errors="coerce")
     fx = fx.dropna(subset=["Date", "USDEUR"]).sort_values("Date")
-    # Keep one value per month, using latest daily quote.
-    fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
+    if not daily:
+        fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
     return fx[["Date", "USDEUR"]]
 
 
-def load_usd_eur_monthly_rates_from_content(contents: str, fallback_path: Path) -> tuple[pd.DataFrame, str]:
+def load_usd_eur_rates_from_content(contents: str, fallback_path: Path, daily: bool = False) -> tuple[pd.DataFrame, str]:
     if contents:
         _, content_string = contents.split(",", 1)
         decoded = base64.b64decode(content_string)
         fx = pd.read_csv(io.StringIO(decoded.decode("utf-8")), usecols=["date", "rate"])
-        fx["Date"] = pd.to_datetime(fx["date"], errors="coerce") + pd.offsets.MonthEnd(0)
+        fx["Date"] = pd.to_datetime(fx["date"], errors="coerce")
+        if not daily:
+            fx["Date"] = fx["Date"] + pd.offsets.MonthEnd(0)
         fx["USDEUR"] = pd.to_numeric(fx["rate"], errors="coerce")
         fx = fx.dropna(subset=["Date", "USDEUR"]).sort_values("Date")
-        fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
+        if not daily:
+            fx = fx.groupby("Date", as_index=False)["USDEUR"].last()
         return fx[["Date", "USDEUR"]], "Uploaded FX file"
-    return load_usd_eur_monthly_rates(fallback_path), fallback_path.name
+    return load_usd_eur_rates(fallback_path, daily=daily), fallback_path.name
 
 
-def build_regression_dataset(contents: str, factor_contents: str, factor_choice: str) -> tuple[pd.DataFrame, str, list[str]]:
+def build_regression_dataset(
+    contents: str, factor_contents: str, factor_choice: str, daily: bool = False
+) -> tuple[pd.DataFrame, str, list[str]]:
     if factor_choice == "uploaded":
-        factors, factor_label = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)
+        factors, factor_label = load_ff3_factors_from_content(factor_contents, FACTOR_FILE, daily=daily)
     else:
-        factors, factor_label = load_ff3_factors(FACTOR_FILE), FACTOR_FILE.name
+        factors, factor_label = load_ff3_factors(FACTOR_FILE, daily=daily), FACTOR_FILE.name
     portfolio = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
-    portfolio["PortfolioReturn"] = portfolio["IndexLevel"].pct_change()
-    portfolio = portfolio.dropna(subset=["PortfolioReturn"])
 
-    merged = portfolio.merge(factors, on="Date", how="inner")
+    if not daily:
+        portfolio = portfolio.copy()
+        portfolio["PortfolioReturn"] = portfolio["IndexLevel"].pct_change()
+        portfolio = portfolio.dropna(subset=["PortfolioReturn"])
+        merged = portfolio.merge(factors, on="Date", how="inner")
+    else:
+        merged = pd.merge_asof(
+            factors.sort_values("Date"),
+            portfolio.sort_values("Date")[["Date", "IndexLevel"]],
+            on="Date",
+            direction="backward",
+        )
+        merged["PortfolioReturn"] = merged["IndexLevel"].pct_change()
+        merged = merged.dropna(subset=["IndexLevel"])
+
     if merged.empty:
         raise ValueError("No overlapping dates between portfolio and factor data.")
 
@@ -143,13 +183,19 @@ def build_regression_dataset(contents: str, factor_contents: str, factor_choice:
 
 
 def run_factor_regression(
-    dataset: pd.DataFrame, factor_cols: list[str], algo: str, ridge_alpha: float
+    dataset: pd.DataFrame,
+    factor_cols: list[str],
+    algo: str,
+    ridge_alpha: float,
+    daily: bool = False,
 ) -> tuple[pd.DataFrame, dict, np.ndarray, pd.Series]:
     x = dataset[factor_cols]
     y = dataset["ExcessReturn"]
 
-    if len(dataset) < 24:
-        raise ValueError("Not enough observations. Need at least 24 monthly points.")
+    min_obs = 252 if daily else 24
+    if len(dataset) < min_obs:
+        unit = "daily" if daily else "monthly"
+        raise ValueError(f"Not enough observations. Need at least {min_obs} {unit} points.")
 
     x_const = sm.add_constant(x, has_constant="add")
     n_obs = len(y)
@@ -212,7 +258,11 @@ def build_reconstructed_history(
     factors["PredExcess"] = x_full.to_numpy() @ ordered_params
     factors["PredReturn"] = factors["PredExcess"] + factors["RF"]
 
-    anchor_row = portfolio_prices.dropna(subset=["Date", "IndexLevel"]).sort_values("Date").iloc[0]
+    factor_dates = set(factors["Date"].tolist())
+    overlapping_portfolio = portfolio_prices[portfolio_prices["Date"].isin(factor_dates)].dropna(subset=["Date", "IndexLevel"]).sort_values("Date")
+    if overlapping_portfolio.empty:
+        raise ValueError("No overlapping portfolio date found in factor timeline for reconstruction anchor.")
+    anchor_row = overlapping_portfolio.iloc[0]
     anchor_date = anchor_row["Date"]
     anchor_level = float(anchor_row["IndexLevel"])
 
@@ -309,51 +359,107 @@ app.layout = html.Div(
         ),
         html.Div(id="fx-file-feedback", style={"marginBottom": "10px", "color": "#555"}),
         html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "center", "marginBottom": "10px"},
+            style={"width": "100%", "marginBottom": "10px", "boxSizing": "border-box"},
             children=[
-                dcc.Dropdown(
-                    id="factor-choice",
-                    options=[
-                        {"label": f"Default: {FACTOR_FILE.name}", "value": "default"},
-                        {"label": "Use uploaded factor file", "value": "uploaded"},
+                html.Div(
+                    style={
+                        "display": "grid",
+                        "gridTemplateColumns": "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
+                        "gap": "10px",
+                        "marginBottom": "10px",
+                    },
+                    children=[
+                        dcc.Dropdown(
+                            id="factor-choice",
+                            options=[
+                                {"label": f"Default: {FACTOR_FILE.name}", "value": "default"},
+                                {"label": "Use uploaded factor file", "value": "uploaded"},
+                            ],
+                            value="default",
+                            clearable=False,
+                            style={"width": "100%"},
+                        ),
+                        dcc.Dropdown(
+                            id="fx-choice",
+                            options=[
+                                {"label": f"FX default: {FX_FILE.name}", "value": "default"},
+                                {"label": "Use uploaded FX file", "value": "uploaded"},
+                            ],
+                            value="default",
+                            clearable=False,
+                            style={"width": "100%"},
+                        ),
+                        html.Div(
+                            style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "alignItems": "center"},
+                            children=[
+                                dcc.Dropdown(
+                                    id="regression-algo",
+                                    options=[
+                                        {"label": "OLS", "value": "ols"},
+                                        {"label": "Ridge (L2)", "value": "ridge"},
+                                    ],
+                                    value="ols",
+                                    clearable=False,
+                                    style={"minWidth": "110px", "flex": "1 1 110px"},
+                                ),
+                                dcc.Input(
+                                    id="ridge-alpha",
+                                    type="number",
+                                    value=1.0,
+                                    min=0.0,
+                                    step=0.1,
+                                    debounce=True,
+                                    placeholder="Ridge alpha",
+                                    style={"width": "120px", "flex": "0 0 auto"},
+                                ),
+                            ],
+                        ),
                     ],
-                    value="default",
-                    clearable=False,
-                    style={"minWidth": "300px"},
                 ),
-                dcc.Dropdown(
-                    id="fx-choice",
-                    options=[
-                        {"label": f"FX default: {FX_FILE.name}", "value": "default"},
-                        {"label": "Use uploaded FX file", "value": "uploaded"},
+                html.Div(
+                    style={
+                        "display": "flex",
+                        "flexWrap": "wrap",
+                        "gap": "12px",
+                        "alignItems": "center",
+                        "width": "100%",
+                    },
+                    children=[
+                        html.Div(
+                            style={"flex": "1 1 280px", "minWidth": "min(100%, 240px)", "maxWidth": "100%"},
+                            children=[
+                                dcc.DatePickerRange(
+                                    id="date-range",
+                                    display_format="YYYY-MM-DD",
+                                    style={"width": "100%"},
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            style={
+                                "display": "flex",
+                                "flexWrap": "wrap",
+                                "gap": "10px",
+                                "alignItems": "center",
+                                "flex": "1 1 auto",
+                            },
+                            children=[
+                                dcc.RadioItems(
+                                    id="frequency-mode",
+                                    options=[
+                                        {"label": " Monthly ", "value": "monthly"},
+                                        {"label": " Daily ", "value": "daily"},
+                                    ],
+                                    value="monthly",
+                                    inline=True,
+                                    style={"whiteSpace": "nowrap"},
+                                ),
+                                html.Button("Run Regression", id="run-btn", n_clicks=0),
+                                html.Button("Download Results CSV", id="download-btn", n_clicks=0),
+                            ],
+                        ),
                     ],
-                    value="default",
-                    clearable=False,
-                    style={"minWidth": "280px"},
                 ),
-                dcc.Dropdown(
-                    id="regression-algo",
-                    options=[
-                        {"label": "OLS", "value": "ols"},
-                        {"label": "Ridge (L2)", "value": "ridge"},
-                    ],
-                    value="ols",
-                    clearable=False,
-                    style={"minWidth": "180px"},
-                ),
-                dcc.Input(
-                    id="ridge-alpha",
-                    type="number",
-                    value=1.0,
-                    min=0.0,
-                    step=0.1,
-                    debounce=True,
-                    placeholder="Ridge alpha",
-                    style={"width": "130px"},
-                ),
-                dcc.DatePickerRange(id="date-range", display_format="YYYY-MM-DD"),
-                html.Button("Run Regression", id="run-btn", n_clicks=0),
-                html.Button("Download Results CSV", id="download-btn", n_clicks=0),
             ],
         ),
         dcc.Download(id="download-results"),
@@ -391,10 +497,12 @@ app.layout = html.Div(
     Input("portfolio-upload", "contents"),
     Input("factor-upload", "contents"),
     Input("factor-choice", "value"),
+    Input("frequency-mode", "value"),
 )
-def refresh_date_bounds(contents, factor_contents, factor_choice):
+def refresh_date_bounds(contents, factor_contents, factor_choice, frequency_mode):
     try:
-        ds, _, _ = build_regression_dataset(contents, factor_contents, factor_choice)
+        daily = frequency_mode == "daily"
+        ds, _, _ = build_regression_dataset(contents, factor_contents, factor_choice, daily=daily)
         min_date = ds["Date"].min().date()
         max_date = ds["Date"].max().date()
         return min_date, max_date, min_date, max_date
@@ -502,19 +610,37 @@ def update_fx_dropdown_options(fx_filename):
     State("ridge-alpha", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
+    State("frequency-mode", "value"),
     prevent_initial_call=True,
 )
 def run_analysis(
-    _, contents, factor_contents, factor_choice, fx_contents, fx_choice, regression_algo, ridge_alpha, start_date, end_date
+    _,
+    contents,
+    factor_contents,
+    factor_choice,
+    fx_contents,
+    fx_choice,
+    regression_algo,
+    ridge_alpha,
+    start_date,
+    end_date,
+    frequency_mode,
 ):
     try:
+        daily = frequency_mode == "daily"
         portfolio_prices = load_portfolio_prices_from_content(contents, DEFAULT_PORTFOLIO_FILE)
-        ds, factor_label, factor_cols = build_regression_dataset(contents, factor_contents, factor_choice)
-        factors = load_ff3_factors_from_content(factor_contents, FACTOR_FILE)[0] if factor_choice == "uploaded" else load_ff3_factors(FACTOR_FILE)
+        ds, factor_label, factor_cols = build_regression_dataset(
+            contents, factor_contents, factor_choice, daily=daily
+        )
+        factors = (
+            load_ff3_factors_from_content(factor_contents, FACTOR_FILE, daily=daily)[0]
+            if factor_choice == "uploaded"
+            else load_ff3_factors(FACTOR_FILE, daily=daily)
+        )
         fx_rates, fx_label = (
-            load_usd_eur_monthly_rates_from_content(fx_contents, FX_FILE)
+            load_usd_eur_rates_from_content(fx_contents, FX_FILE, daily=daily)
             if fx_choice == "uploaded"
-            else (load_usd_eur_monthly_rates(FX_FILE), FX_FILE.name)
+            else (load_usd_eur_rates(FX_FILE, daily=daily), FX_FILE.name)
         )
         if start_date and end_date:
             start = pd.to_datetime(start_date)
@@ -522,7 +648,11 @@ def run_analysis(
             ds = ds[(ds["Date"] >= start) & (ds["Date"] <= end)].copy()
 
         coeff_table, metrics, fitted, params = run_factor_regression(
-            ds, factor_cols, regression_algo or "ols", ridge_alpha if ridge_alpha is not None else 1.0
+            ds,
+            factor_cols,
+            regression_algo or "ols",
+            ridge_alpha if ridge_alpha is not None else 1.0,
+            daily=daily,
         )
         ds["FittedExcess"] = fitted
         ds["Residual"] = ds["ExcessReturn"] - ds["FittedExcess"]
@@ -609,11 +739,18 @@ def run_analysis(
         result_export = result_export.rename(columns={"ReconstructedLevelEUR": "CumulativePortfolioValueEUR"})
         result_export["Date"] = result_export["Date"].dt.strftime("%Y-%m-%d")
 
+        freq_label = "daily" if daily else "monthly"
+        extra = (
+            " Portfolio levels are as-of merged to factor dates (forward-filled from last observation); "
+            "with a monthly portfolio file, most daily returns are zero except around level updates."
+            if daily
+            else ""
+        )
         status = (
-            f"Regression completed on {len(ds)} monthly observations. "
+            f"Regression completed on {len(ds)} {freq_label} observations. "
             f"Algorithm: {(regression_algo or 'ols').upper()}. "
             f"Factors used: {', '.join(factor_cols)}. "
-            f"Factor source: {factor_label}. FX source: {fx_label}. Currency conversion: USD->EUR applied."
+            f"Factor source: {factor_label}. FX source: {fx_label}. Currency conversion: USD->EUR applied.{extra}"
         )
         return (
             status,
