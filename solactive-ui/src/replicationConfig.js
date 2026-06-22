@@ -41,6 +41,7 @@ export const REGION_CONFIG = {
     volRollPolicy: "realized",
     volMarkPolicy: "realized",
     ...GUIDELINE,
+    volLookback: 63,
   },
 };
 
@@ -52,7 +53,7 @@ export const REPLICATION_CAVEATS = [
   "Expiries settle on the first trading day on or after the scheduled Friday (holiday adjustment).",
   "Euro parameters inferred from US Solactive guideline v1.2.",
   "Index inception level and start date taken from solactive.parquet.",
-  "Roll and mark vol use 21-day realized underlying vol (not VIX/V2TX) for BS premium and marking.",
+  "Roll and mark vol use realized underlying vol (not VIX/V2TX) for BS premium and marking — 63-day US, 21-day EUR.",
   "No historical CBOE/Eurex option settlement prices — replication is approximate.",
 ];
 

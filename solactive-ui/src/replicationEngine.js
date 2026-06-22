@@ -119,6 +119,7 @@ function markPutPrice(spot, p, dateStr, rate, markVol, cfg) {
     cfg.optionCostFloor, cfg.vegaRatioMin, cfg.vegaRatioScale, cfg.ivBarrier,
   );
   // Short puts: BS fallback marks at ask (mid + spread) when exchange quotes unavailable.
+  if (cfg.markAtMid) return Math.max(intrinsic, mid);
   return Math.max(intrinsic, mid + spread);
 }
 
@@ -134,7 +135,12 @@ function markPuts(puts, dateStr, spot, rate, currentVol, cfg) {
 function volForDay(cfg, dateStr, volIndex, underlyingRets, purpose = "default") {
   const indexIv = volIndex?.[dateStr];
   const fromIndex = indexIv != null && indexIv > 0 ? indexIv / 100 : null;
-  const fromRealized = realizedVol(underlyingRets, cfg.volLookback);
+  const fromRealized = realizedVol(
+    underlyingRets,
+    purpose === "mark" && cfg.volMarkLookback
+      ? cfg.volMarkLookback
+      : cfg.volLookback,
+  );
   const policy = purpose === "roll"
     ? (cfg.volRollPolicy ?? cfg.volPolicy ?? "index")
     : (cfg.volMarkPolicy ?? cfg.volPolicy ?? "index");
@@ -142,6 +148,12 @@ function volForDay(cfg, dateStr, volIndex, underlyingRets, purpose = "default") 
   let vol;
   if (policy === "realized") {
     vol = fromRealized ?? fromIndex ?? cfg.ivMin;
+  } else if (policy === "blendIndexRealized") {
+    if (fromIndex != null && fromRealized != null) vol = 0.5 * (fromIndex + fromRealized);
+    else vol = fromIndex ?? fromRealized ?? cfg.ivMin;
+  } else if (policy === "maxIndexRealized") {
+    if (fromIndex != null && fromRealized != null) vol = Math.max(fromIndex, fromRealized);
+    else vol = fromIndex ?? fromRealized ?? cfg.ivMin;
   } else if (policy === "minIndexRealized") {
     if (fromIndex != null && fromRealized != null) vol = Math.min(fromIndex, fromRealized);
     else vol = fromIndex ?? fromRealized ?? cfg.ivMin;

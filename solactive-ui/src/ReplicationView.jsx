@@ -11,7 +11,13 @@ import {
   YAxis,
 } from "recharts";
 import { DEFENSIVE_PUT_ISINS } from "./defensivePut";
+import { downloadTextFile } from "./downloadUtils";
 import { loadReplicationData } from "./replicationData";
+import { buildReplicationCsv, replicationCsvFilename } from "./replicationCsv";
+import {
+  buildMethodologyMarkdown,
+  methodologyMarkdownFilename,
+} from "./replicationMethodologyMarkdown";
 import ReplicationMethodologyDoc from "./ReplicationMethodologyDoc";
 import { metricRows, formatMetricValue, pct, num } from "./replicationMetrics";
 
@@ -129,6 +135,23 @@ export default function ReplicationView() {
     return formatMetricValue(row.metric, v);
   };
 
+  const downloadCsv = () => {
+    if (!data?.points?.length) return;
+    downloadTextFile(
+      replicationCsvFilename(region, data.meta),
+      buildReplicationCsv(data.points, data.meta),
+      "text/csv;charset=utf-8",
+    );
+  };
+
+  const downloadMethodology = () => {
+    downloadTextFile(
+      methodologyMarkdownFilename(region, data?.meta),
+      buildMethodologyMarkdown(region, data?.meta),
+      "text/markdown;charset=utf-8",
+    );
+  };
+
   return (
     <div>
       <header className="mb-6">
@@ -153,6 +176,22 @@ export default function ReplicationView() {
           className="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800"
         >
           {showMethodology ? "Hide" : "Show"} methodology
+        </button>
+        <button
+          type="button"
+          onClick={downloadCsv}
+          disabled={!data?.points?.length || loading}
+          className="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Download CSV
+        </button>
+        <button
+          type="button"
+          onClick={downloadMethodology}
+          disabled={loading}
+          className="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Download methodology (.md)
         </button>
       </div>
 

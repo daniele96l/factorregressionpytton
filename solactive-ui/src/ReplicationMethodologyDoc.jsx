@@ -115,7 +115,7 @@ IP_inception = IP on first simulated day (portfolio start)`}</Formula>
           <strong className="text-slate-200">Risk-free</strong>: FRED {cfg.fredId} (3-month), aligned to trading days.
         </li>
         <li>
-          <strong className="text-slate-200">Vol for rolls &amp; marks</strong>: {GUIDELINE.volLookback}-day realized vol of
+          <strong className="text-slate-200">Vol for rolls &amp; marks</strong>: {cfg.volLookback}-day realized vol of
           underlying daily returns (annualized √252). VIX/V2TX are not used — realized vol aligns US replication with
           the Euro fallback and official BS premium levels more closely than index implied vol.
         </li>
@@ -203,9 +203,9 @@ Skip leg if Premium_bid / S < premium floor (0).`}</Formula>
       <p>Daily mark vol uses a <strong>parallel index-vol surface shift</strong> (BS fallback when no exchange quote):</p>
       <Formula>{`σ_mark = clamp( σ_entry + (σ_index,t − σ_index,entry),  IV_min, IV_max )
 
-σ_index,t = σ_realized,t   (21-day underlying return vol, annualized)
+σ_index,t = σ_realized,t   ({cfg.volLookback}-day underlying return vol, annualized)
 
-σ_realized,t = std(r_{t−20..t}) · √252
+σ_realized,t = std(r_{t−{cfg.volLookback - 1}..t}) · √252
 
 Mark_price = max( intrinsic,  Put_mid(S_close, K, σ_mark) + Spread_mark )
 intrinsic  = max(0, K − S_close)
