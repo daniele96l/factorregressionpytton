@@ -1,5 +1,7 @@
-dash
-pandas
-numpy
-plotly
-statsmodels
+dash
+pandas
+numpy
+plotly
+statsmodels
+pyarrow
+yfinance

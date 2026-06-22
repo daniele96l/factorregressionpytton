@@ -23,31 +23,30 @@ DEFAULT_PORTFOLIO_COLUMN = "MSCI USA Small Cap Value Weighted"
 FX_FILE = Path(__file__).resolve().parent / "usd_eur_rate_rows.csv"
 
 
-def _combined_positive_y_range(*series: pd.Series) -> list[float] | None:
-    parts = [pd.to_numeric(s, errors="coerce") for s in series]
-    vals = pd.concat(parts, ignore_index=True).replace([np.inf, -np.inf], np.nan).dropna()
-    vals = vals[vals > 0]
-    if len(vals) == 0:
-        return None
-    lo, hi = float(vals.min()), float(vals.max())
-    if abs(hi - lo) < 1e-9 * max(hi, 1.0):
-        hi = lo * 1.05
-    pad = 0.05 * (hi - lo)
-    return [lo - pad, hi + pad]
-
-
-def _yaxis_for_index_chart(*series: pd.Series) -> dict:
-    yaxis: dict = {
-        "type": "linear",
-        "tickformat": ",.0f",
+def _yaxis_log_normalized_index_chart(*series: pd.Series) -> dict:
+    """Log y-axis for normalized index series (strictly positive); suppress noisy minor ticks."""
+    ys = pd.concat([pd.to_numeric(s, errors="coerce") for s in series], ignore_index=True).dropna()
+    ys = ys[ys > 0]
+    if ys.empty:
+        return {
+            "type": "log",
+            "tickformat": ",.2f",
+            "dtick": 1,
+            "minor": {"ticks": "", "showgrid": False},
+            "automargin": True,
+            "showexponent": "none",
+        }
+    lo, hi = float(ys.min()), float(ys.max())
+    lo = max(lo, 1e-9)
+    return {
+        "type": "log",
+        "tickformat": ",.2f",
+        "dtick": 1,
+        "minor": {"ticks": "", "showgrid": False},
         "automargin": True,
         "showexponent": "none",
-        "nticks": 10,
+        "range": [lo * 0.95, hi * 1.05],
     }
-    rng = _combined_positive_y_range(*series)
-    if rng is not None:
-        yaxis["range"] = rng
-    return yaxis
 
 
 def parse_ff3_factors(raw: pd.DataFrame, daily: bool = False) -> pd.DataFrame:
@@ -869,7 +868,7 @@ def run_analysis(
             height=420,
             margin=dict(l=72, r=24, t=56, b=48),
             yaxis=dict(
-                **_yaxis_for_index_chart(plot_chart["ReconUSDIdx"], plot_chart["ActualUSDIdx"]),
+                **_yaxis_log_normalized_index_chart(plot_chart["ReconUSDIdx"], plot_chart["ActualUSDIdx"]),
                 title="Index (start = 100)",
             ),
             uirevision=f"recon-usd-{int(n_clicks or 0)}",
@@ -898,7 +897,7 @@ def run_analysis(
             height=420,
             margin=dict(l=72, r=24, t=56, b=48),
             yaxis=dict(
-                **_yaxis_for_index_chart(plot_chart["ReconEURIdx"], plot_chart["ActualEURIdx"]),
+                **_yaxis_log_normalized_index_chart(plot_chart["ReconEURIdx"], plot_chart["ActualEURIdx"]),
                 title="Index (start = 100)",
             ),
             uirevision=f"recon-eur-{int(n_clicks or 0)}",
@@ -967,4 +966,6 @@ def download_results(_, data):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import os
+
+    app.run(debug=True, port=int(os.environ.get("PORT", "8050")))
