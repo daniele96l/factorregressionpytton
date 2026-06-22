@@ -26,6 +26,8 @@ export const REGION_CONFIG = {
     volIndexTickers: ["^V2TX", "^VSTOXX"],
     fredId: "IR3TIB01EZM156N",
     strikeInterval: 50,
+    volRollPolicy: "realized",
+    volMarkPolicy: "realized",
     ...GUIDELINE,
   },
   usd: {
@@ -36,6 +38,8 @@ export const REGION_CONFIG = {
     volIndexTickers: ["^VIX"],
     fredId: "DTB3",
     strikeInterval: 5,
+    volRollPolicy: "realized",
+    volMarkPolicy: "realized",
     ...GUIDELINE,
   },
 };
@@ -48,6 +52,7 @@ export const REPLICATION_CAVEATS = [
   "Expiries settle on the first trading day on or after the scheduled Friday (holiday adjustment).",
   "Euro parameters inferred from US Solactive guideline v1.2.",
   "Index inception level and start date taken from solactive.parquet.",
+  "Roll and mark vol use 21-day realized underlying vol (not VIX/V2TX) for BS premium and marking.",
   "No historical CBOE/Eurex option settlement prices — replication is approximate.",
 ];
 

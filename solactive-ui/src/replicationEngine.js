@@ -131,11 +131,23 @@ function markPuts(puts, dateStr, spot, rate, currentVol, cfg) {
   return total;
 }
 
-function volForDay(cfg, dateStr, volIndex, underlyingRets) {
+function volForDay(cfg, dateStr, volIndex, underlyingRets, purpose = "default") {
   const indexIv = volIndex?.[dateStr];
   const fromIndex = indexIv != null && indexIv > 0 ? indexIv / 100 : null;
   const fromRealized = realizedVol(underlyingRets, cfg.volLookback);
-  const vol = fromIndex ?? fromRealized ?? cfg.ivMin;
+  const policy = purpose === "roll"
+    ? (cfg.volRollPolicy ?? cfg.volPolicy ?? "index")
+    : (cfg.volMarkPolicy ?? cfg.volPolicy ?? "index");
+
+  let vol;
+  if (policy === "realized") {
+    vol = fromRealized ?? fromIndex ?? cfg.ivMin;
+  } else if (policy === "minIndexRealized") {
+    if (fromIndex != null && fromRealized != null) vol = Math.min(fromIndex, fromRealized);
+    else vol = fromIndex ?? fromRealized ?? cfg.ivMin;
+  } else {
+    vol = fromIndex ?? fromRealized ?? cfg.ivMin;
+  }
   return clampIv(vol, cfg.ivMin, cfg.ivMax);
 }
 
@@ -170,7 +182,7 @@ export function runSimulation(
     }
 
     const rate = (riskFreeSeries[dateStr] ?? riskFreeSeries._last ?? 2) / 100;
-    const vol = volForDay(cfg, dateStr, volIndexSeries, underlyingRets);
+    const vol = volForDay(cfg, dateStr, volIndexSeries, underlyingRets, "mark");
 
     const stillLive = [];
     for (const p of puts) {
@@ -204,15 +216,16 @@ export function runSimulation(
 
       const strikeRef = prevSettle ?? settle;
       const rollSpot = settle;
+      const rollVol = volForDay(cfg, dateStr, volIndexSeries, underlyingRets, "roll");
       for (const { expiry, weight } of legs) {
         if (weight <= 0) continue;
         const expiryTrading = snapExpiryToTradingDay(expiry, tradingDates);
         const strike = nearestStrike(cfg.targetStrikePct * strikeRef, cfg.strikeInterval);
         const days = Math.max(daysBetweenStr(dateStr, expiryTrading), 1);
-        const px = bsPutPrice(rollSpot, strike, days, rate, 0, vol);
-        const vega = bsVega(rollSpot, strike, days, rate, 0, vol);
+        const px = bsPutPrice(rollSpot, strike, days, rate, 0, rollVol);
+        const vega = bsVega(rollSpot, strike, days, rate, 0, rollVol);
         const spread = optionSpread(
-          rollSpot, vol, vega,
+          rollSpot, rollVol, vega,
           cfg.optionCostFloor, cfg.vegaRatioMin, cfg.vegaRatioScale, cfg.ivBarrier,
         );
         const premium = px - spread;
@@ -225,7 +238,7 @@ export function runSimulation(
           strike,
           units,
           vol: entryVol,
-          indexVolAtEntry: vol,
+          indexVolAtEntry: rollVol,
         });
       }
       optMtm = markPuts(puts, dateStr, spot, rate, vol, cfg);

@@ -12,6 +12,7 @@ import {
 } from "recharts";
 import { DEFENSIVE_PUT_ISINS } from "./defensivePut";
 import { loadReplicationData } from "./replicationData";
+import ReplicationMethodologyDoc from "./ReplicationMethodologyDoc";
 import { metricRows, formatMetricValue, pct, num } from "./replicationMetrics";
 
 function Stat({ label, value }) {
@@ -337,6 +338,8 @@ export default function ReplicationView() {
           </section>
         </>
       )}
+
+      <ReplicationMethodologyDoc region={region} meta={data?.meta} />
     </div>
   );
 }
