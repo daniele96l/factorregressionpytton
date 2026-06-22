@@ -108,18 +108,25 @@ function putMarkVol(p, currentVol, cfg) {
   return clampIv(p.vol + (currentVol - indexVolAtEntry), cfg.ivMin, cfg.ivMax);
 }
 
-function markPutPrice(spot, p, dateStr, rate, markVol) {
+function markPutPrice(spot, p, dateStr, rate, markVol, cfg) {
   const days = daysBetweenStr(dateStr, p.expiry);
   const intrinsic = Math.max(p.strike - spot, 0);
   if (days <= 0) return intrinsic;
-  return Math.max(intrinsic, bsPutPrice(spot, p.strike, days, rate, 0, markVol));
+  const mid = bsPutPrice(spot, p.strike, days, rate, 0, markVol);
+  const vega = bsVega(spot, p.strike, days, rate, 0, markVol);
+  const spread = optionSpread(
+    spot, markVol, vega,
+    cfg.optionCostFloor, cfg.vegaRatioMin, cfg.vegaRatioScale, cfg.ivBarrier,
+  );
+  // Short puts: BS fallback marks at ask (mid + spread) when exchange quotes unavailable.
+  return Math.max(intrinsic, mid + spread);
 }
 
 function markPuts(puts, dateStr, spot, rate, currentVol, cfg) {
   let total = 0;
   for (const p of puts) {
     const mv = putMarkVol(p, currentVol, cfg);
-    total += p.units * markPutPrice(spot, p, dateStr, rate, mv);
+    total += p.units * markPutPrice(spot, p, dateStr, rate, mv, cfg);
   }
   return total;
 }
@@ -196,21 +203,22 @@ export function runSimulation(
       if (!legs.length && near) legs.push({ expiry: near, weight: 1 });
 
       const strikeRef = prevSettle ?? settle;
+      const rollSpot = settle;
       for (const { expiry, weight } of legs) {
         if (weight <= 0) continue;
         const expiryTrading = snapExpiryToTradingDay(expiry, tradingDates);
         const strike = nearestStrike(cfg.targetStrikePct * strikeRef, cfg.strikeInterval);
         const days = Math.max(daysBetweenStr(dateStr, expiryTrading), 1);
-        const px = bsPutPrice(spot, strike, days, rate, 0, vol);
-        const vega = bsVega(spot, strike, days, rate, 0, vol);
+        const px = bsPutPrice(rollSpot, strike, days, rate, 0, vol);
+        const vega = bsVega(rollSpot, strike, days, rate, 0, vol);
         const spread = optionSpread(
-          spot, vol, vega,
+          rollSpot, vol, vega,
           cfg.optionCostFloor, cfg.vegaRatioMin, cfg.vegaRatioScale, cfg.ivBarrier,
         );
         const premium = px - spread;
-        if (premium / spot < cfg.premiumFloor) continue;
+        if (premium / rollSpot < cfg.premiumFloor) continue;
         const units = cfg.allocation * weight * ipPrev / prevClose;
-        const entryVol = solvePutIv(spot, strike, days, rate, 0, px, cfg.ivMin, cfg.ivMax);
+        const entryVol = solvePutIv(rollSpot, strike, days, rate, 0, px, cfg.ivMin, cfg.ivMax);
         cash -= units * premium;
         puts.push({
           expiry: expiryTrading,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CartesianGrid,
   Legend,
@@ -23,12 +23,59 @@ function Stat({ label, value }) {
   );
 }
 
+function chartDomain(points, keys, { log = false, pad = 0.06 } = {}) {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of points) {
+    for (const k of keys) {
+      const v = p[k];
+      if (v == null || !Number.isFinite(v) || v <= 0) continue;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return ["auto", "auto"];
+  if (log) {
+    const logLo = Math.log10(lo);
+    const logHi = Math.log10(hi);
+    const span = Math.max(logHi - logLo, 0.02);
+    return [
+      10 ** (logLo - pad * span),
+      10 ** (logHi + pad * span),
+    ];
+  }
+  const span = Math.max(hi - lo, 1);
+  return [lo - pad * span, hi + pad * span];
+}
+
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0]?.payload;
+  const date = label ? new Date(label).toISOString().slice(0, 10) : row?.date;
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-950/95 px-3 py-2 text-xs text-slate-200 shadow-lg">
+      <div className="mb-1 font-medium text-slate-100">{date}</div>
+      {payload.map((item) => (
+        <div key={item.dataKey} style={{ color: item.color }}>
+          {item.name}: {Number(item.value).toFixed(2)}
+        </div>
+      ))}
+      {row?.official > 0 && row?.replicated != null && (
+        <div className="mt-1 border-t border-slate-800 pt-1 text-slate-400">
+          Gap: {num(row.gap, 2)} ({num((row.replicated / row.official - 1) * 100, 1)}%)
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ReplicationView() {
   const [region, setRegion] = useState("eur");
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showMethodology, setShowMethodology] = useState(false);
+  const [logScale, setLogScale] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -56,6 +103,20 @@ export default function ReplicationView() {
     region === "eur" ? x.isin === "DE000SL0AS77" : x.isin === "DE000SL0AS51",
   );
   const rows = metricRows(data?.metrics);
+
+  const levelDomain = useMemo(
+    () => (data?.points ? chartDomain(data.points, ["replicated", "official"], { log: logScale }) : ["auto", "auto"]),
+    [data?.points, logScale],
+  );
+
+  const gapPctDomain = useMemo(() => {
+    if (!data?.points?.length) return ["auto", "auto"];
+    const vals = data.points.map((p) => (p.official > 0 ? (p.replicated / p.official - 1) * 100 : 0));
+    const lo = Math.min(...vals);
+    const hi = Math.max(...vals);
+    const pad = Math.max((hi - lo) * 0.08, 1);
+    return [lo - pad, hi + pad];
+  }, [data?.points]);
 
   const formatCell = (row, which) => {
     const v = row[which];
@@ -100,8 +161,8 @@ export default function ReplicationView() {
           <ul className="list-inside list-disc space-y-1">
             <li>Weekly Friday roll of 4-week (28d) European puts at 97% strike; short −¼ notional per tranche.</li>
             <li>Cash leg earns 3-month risk-free; fees per Solactive amendment schedule.</li>
-            <li>Option marks: Black-Scholes with entry implied vol per tranche; VIX/V2TX when available.</li>
-            <li>Inception level and start date from official parquet; SPXSET proxied by Yahoo open.</li>
+            <li>Friday rolls price new puts at opening settlement; daily marks use close with ask-side BS fallback.</li>
+            <li>Option marks: entry IV per tranche with parallel index-vol surface shift.</li>
           </ul>
           <p className="mt-3">
             <a
@@ -137,7 +198,25 @@ export default function ReplicationView() {
           </div>
 
           <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/50 p-4">
-            <h2 className="mb-2 text-lg font-semibold text-white">Replicated vs official (base 100)</h2>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold text-white">Replicated vs official (base 100)</h2>
+              <div className="flex rounded-lg border border-slate-700 p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setLogScale(true)}
+                  className={`rounded-md px-2.5 py-1 ${logScale ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"}`}
+                >
+                  Log scale
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLogScale(false)}
+                  className={`rounded-md px-2.5 py-1 ${!logScale ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"}`}
+                >
+                  Linear
+                </button>
+              </div>
+            </div>
             <div className="h-[380px]">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={data.points}>
@@ -151,24 +230,32 @@ export default function ReplicationView() {
                     tickFormatter={(ts) => new Date(ts).toISOString().slice(0, 10)}
                     minTickGap={50}
                   />
-                  <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} domain={["auto", "auto"]} />
-                  <Tooltip
-                    labelFormatter={(ts) => new Date(ts).toISOString().slice(0, 10)}
-                    contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
+                  <YAxis
+                    scale={logScale ? "log" : "linear"}
+                    domain={levelDomain}
+                    tick={{ fill: "#94a3b8", fontSize: 11 }}
+                    tickFormatter={(v) => Number(v).toFixed(0)}
+                    allowDataOverflow
                   />
+                  <Tooltip content={<ChartTooltip />} />
                   <Legend />
-                  <Line type="linear" dataKey="replicated" name="Replicated" stroke="#22d3ee" dot={false} strokeWidth={2} isAnimationActive={false} />
-                  <Line type="linear" dataKey="official" name="Official (parquet)" stroke="#818cf8" dot={false} strokeWidth={2} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="replicated" name="Replicated" stroke="#22d3ee" dot={false} strokeWidth={2} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="official" name="Official (parquet)" stroke="#818cf8" dot={false} strokeWidth={2} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
           </section>
 
           <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/50 p-4">
-            <h2 className="mb-2 text-lg font-semibold text-white">Level gap (replicated − official)</h2>
+            <h2 className="mb-2 text-lg font-semibold text-white">Level drift (replicated / official − 1)</h2>
             <div className="h-[200px]">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={data.points}>
+                <LineChart
+                  data={data.points.map((p) => ({
+                    ...p,
+                    gapPct: p.official > 0 ? (p.replicated / p.official - 1) * 100 : null,
+                  }))}
+                >
                   <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
                   <XAxis
                     dataKey="ts"
@@ -179,13 +266,18 @@ export default function ReplicationView() {
                     tickFormatter={(ts) => new Date(ts).toISOString().slice(0, 10)}
                     minTickGap={50}
                   />
-                  <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} />
+                  <YAxis
+                    tick={{ fill: "#94a3b8", fontSize: 11 }}
+                    domain={gapPctDomain}
+                    tickFormatter={(v) => `${Number(v).toFixed(0)}%`}
+                  />
                   <ReferenceLine y={0} stroke="#64748b" strokeDasharray="4 4" />
                   <Tooltip
                     labelFormatter={(ts) => new Date(ts).toISOString().slice(0, 10)}
+                    formatter={(v) => [`${Number(v).toFixed(2)}%`, "Level drift"]}
                     contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
                   />
-                  <Line type="linear" dataKey="gap" name="Level gap (pts)" stroke="#f472b6" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="gapPct" name="Level drift" stroke="#f472b6" dot={false} strokeWidth={1.5} isAnimationActive={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>

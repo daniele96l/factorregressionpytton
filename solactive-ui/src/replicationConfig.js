@@ -43,7 +43,8 @@ export const REGION_CONFIG = {
 export const REPLICATION_CAVEATS = [
   "Underlying closes use Yahoo price index (unadjusted), not total-return adjusted.",
   "Strike and expiry settlement use Yahoo open as SPXSET proxy (not official SPXSET).",
-  "Option marks: Black-Scholes with entry IV per tranche and parallel index-vol surface shift.",
+  "Option marks: Black-Scholes ask-side (mid + spread) with entry IV and parallel index-vol surface shift.",
+  "Friday rolls price new puts at opening settlement (SPXSET proxy), marks at daily close.",
   "Expiries settle on the first trading day on or after the scheduled Friday (holiday adjustment).",
   "Euro parameters inferred from US Solactive guideline v1.2.",
   "Index inception level and start date taken from solactive.parquet.",
